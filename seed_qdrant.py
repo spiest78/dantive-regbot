@@ -148,8 +148,22 @@ def main():
     print(f"Found {len(files)} files under {DATA_DIR}. Embedding with {EMBED_MODEL} via {OLLAMA_URL}")
 
     # -------- First pass: read & chunk so we know total work --------
-    file_chunks = []  # list of tuples: (path, chunks_list)
+    file_chunks = []
     total_chunks = 0
+    read_start = time.time()
+    for path in files:
+        print(f"[READ] {path}")  # 👈 add this line
+        try:
+            text = read_text_from_file(path)
+        except Exception as e:
+            print(f"[SKIP] {path}: {e}")
+            continue
+        chunks = chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
+        if not chunks:
+            print(f"[SKIP] {path}: no text extracted")
+            continue
+        file_chunks.append((path, chunks))
+        total_chunks += len(chunks)
     read_start = time.time()
     for path in files:
         try:
