@@ -1,13 +1,15 @@
 # scripts/bootstrap.ps1
 # Usage examples:
 #   powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
+#   powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1 -Seed
 #   powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1 -IngestCELEX 32008R1272
 
 param(
   [string]$ComposeFile = "docker-compose.yml",
   [string]$ProjectName = "dantive-regbot",
   [string]$EnvFile     = ".env",
-  [string]$IngestCELEX = ""
+  [string]$IngestCELEX = "",
+  [switch]$Seed
 )
 
 $ErrorActionPreference = "Stop"
@@ -86,10 +88,12 @@ if (-not (Wait-HttpHealthy ("http://localhost:{0}/readyz" -f $QDRANT_PORT))) { D
 Step "Waiting for Ollama CLI to respond"
 if (-not (Wait-ContainerCmd "ollama" @("ollama","list"))) { Die "Ollama not healthy in time" } else { Ok "Ollama healthy" }
 
-# 5) Pull models (safe to re-run)
+# 5) Pull models (safe to re-run) — both mistral + nomic embed
 Step "Pulling models into ollama volume"
 docker compose -p $ProjectName -f $ComposeFile up --no-deps ollama-init
-Ok "Model pull step completed (or skipped)"
+docker compose exec ollama ollama pull mistral:7b-instruct
+docker compose exec ollama ollama pull nomic-embed-text
+Ok "Model pull step completed"
 
 # 6) Start API & UI
 Step "Starting API and UI"
@@ -101,11 +105,29 @@ if (-not (Wait-HttpHealthy ("http://localhost:{0}/health" -f $API_PORT))) { Die 
 Step "Waiting for UI /_stcore/health"
 if (-not (Wait-HttpHealthy ("http://localhost:{0}/_stcore/health" -f $UI_PORT))) { Die "UI not healthy in time" } else { Ok "UI healthy" }
 
-# 7) Optional ingestion
+# 7) Ensure required Python libs inside api
+Step "Installing Python deps inside API container"
+docker compose exec api pip install --quiet qdrant-client pypdf tqdm requests
+Ok "Python deps installed"
+
+# 8) Optional ingestion
 if ($IngestCELEX -ne "") {
   Step ("Running ingestion for CELEX {0}" -f $IngestCELEX)
   docker compose -p $ProjectName -f $ComposeFile run --rm ingest --celex $IngestCELEX
   if ($LASTEXITCODE -eq 0) { Ok "Ingestion completed" } else { Die "Ingestion failed" }
+}
+
+# 9) Optional seed of local PDFs/TXTs
+if ($Seed) {
+  Step "Running Qdrant seeding from apps/data"
+  docker compose exec `
+    --env DATA_DIR=/workspace/apps/data `
+    --env QDRANT_URL=http://qdrant:6333 `
+    --env OLLAMA_URL=http://ollama:11434 `
+    --env EMBED_MODEL=nomic-embed-text `
+    --env QDRANT_COLLECTION=regdocs_v1 `
+    api python /workspace/seed_qdrant.py
+  if ($LASTEXITCODE -eq 0) { Ok "Seeding completed" } else { Die "Seeding failed" }
 }
 
 Ok "Bootstrap finished. Services are up:"
