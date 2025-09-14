@@ -6,7 +6,7 @@ import streamlit as st
 API_URL = os.getenv("API_URL", "http://api:8000")
 
 st.set_page_config(page_title="Dantive RegBot", layout="wide")
-st.title("Dantive — Regulatory RAG (skeleton)")
+st.title("Dantive — Regulatory RAG")
 
 # ---------------- Health ----------------
 with st.expander("Health", expanded=False):
@@ -18,80 +18,131 @@ with st.expander("Health", expanded=False):
         except Exception as e:
             st.error(f"Health check failed: {e}")
 
-# ---------------- Controls ----------------
-st.subheader("Chat (runtime model select)")
+# ---------------- Chat (STRICT RAG) ----------------
+st.subheader("Ask (strict RAG — no hallucinations)")
 
-cols = st.columns([1, 1, 1, 1])
-with cols[0]:
+c1, c2, c3 = st.columns([2, 1, 1])
+with c1:
+    prompt = st.text_area("Prompt", "What does REACH Article 57(f) say about substances of equivalent concern?", height=120)
+with c2:
     model = st.selectbox("Model", ["mistral:7b-instruct", "llama3:8b-instruct"], index=0)
-with cols[1]:
-    temp = st.slider("Temperature", 0.0, 2.0, 0.2, 0.1)
-with cols[2]:
-    top_p = st.slider("Top-p", 0.0, 1.0, 0.9, 0.05)
-with cols[3]:
-    max_tokens = st.number_input("Max tokens", min_value=64, max_value=2048, value=400, step=64)
+with c3:
+    temperature = st.slider("Temperature", 0.0, 1.0, 0.1, 0.05)
 
-prompt = st.text_area("Prompt", "Summarize REACH Article 57 criteria in one sentence.", height=120)
+col_btns = st.columns([1, 1])
+use_stream = col_btns[0].toggle("Stream (strict)", value=False, help="Uses /ask_stream_rag if available")
+timeout_s = col_btns[1].number_input("Timeout (s)", min_value=30, max_value=1800, value=120, step=30)
 
-opt_cols = st.columns([1, 1, 4])
-with opt_cols[0]:
-    stream_mode = st.toggle("Stream answer", value=True)
-with opt_cols[1]:
-    timeout_s = st.number_input("Timeout (s)", min_value=60, max_value=1800, value=600, step=60)
-
-# ---------------- Ask ----------------
-if st.button("Ask"):
+if st.button("Ask (strict)"):
     if not prompt.strip():
         st.warning("Please enter a prompt.")
     else:
-        # payload compatible with your FastAPI models
-        payload = {
-            "prompt": prompt,
-            "model": model,
-            "temperature": float(temp),
-            "top_p": float(top_p),
-            "max_tokens": int(max_tokens),
-        }
-
-        if stream_mode:
-            # ---- Streaming via /ask_stream ----
-            with st.spinner("Thinking…"):
-                try:
+        if use_stream:
+            # Streaming STRICT endpoint (requires /ask_stream_rag on API)
+            try:
+                with st.spinner("Thinking…"):
                     r = requests.post(
-                        f"{API_URL}/ask_stream",
-                        json=payload,
+                        f"{API_URL}/ask_stream_rag",
+                        json={"prompt": prompt, "model": model},
                         stream=True,
-                        timeout=(10, int(timeout_s)),   # (connect, read)
+                        timeout=(10, int(timeout_s)),
                     )
-                    r.raise_for_status()
-                    # live render
-                    ph = st.empty()
-                    buf = []
-                    for chunk in r.iter_content(chunk_size=None, decode_unicode=True):
-                        if not chunk:
-                            continue
-                        buf.append(chunk)
-                        ph.markdown("".join(buf))
-                except Exception as e:
-                    st.error(f"Streaming error: {e}")
+                    if r.status_code == 404:
+                        st.error("`/ask_stream_rag` not found on API. Disable Stream or update API.")
+                    else:
+                        r.raise_for_status()
+                        ph = st.empty()
+                        buf = []
+                        for chunk in r.iter_content(chunk_size=None, decode_unicode=True):
+                            if not chunk:
+                                continue
+                            buf.append(chunk)
+                            ph.markdown("".join(buf))
+            except Exception as e:
+                st.error(f"Streaming error: {e}")
         else:
-            # ---- Non-streaming via /ask ----
-            with st.spinner("Thinking…"):
-                try:
+            # Non-streaming STRICT endpoint
+            try:
+                with st.spinner("Thinking…"):
                     r = requests.post(
                         f"{API_URL}/ask",
-                        json=payload,
+                        json={"prompt": prompt, "model": model},
                         timeout=int(timeout_s),
                     )
                     r.raise_for_status()
-                    data = r.json()
-                    st.write(f"**Model**: {data.get('model','')}")
-                    st.markdown(data.get("output", ""))
-                except Exception as e:
-                    st.error(f"Request error: {e}")
+                    res = r.json()
 
-# ---------------- Small UX niceties ----------------
-st.caption(
-    "Tip: If long answers time out, lower **Max tokens** or enable **Stream answer**. "
-    "Timeout can be adjusted above."
-)
+                # Render strict response
+                st.markdown(f"**Model:** `{res.get('model','')}`")
+                st.write("### Answer")
+                st.write(res.get("answer", ""))
+
+                policy = res.get("policy", {})
+                if not policy.get("answered", True):
+                    st.warning("No relevant documents above the threshold. Answer withheld.")
+
+                st.write("### Citations")
+                cits = res.get("citations", [])
+                if not cits:
+                    st.caption("No citations.")
+                else:
+                    for c in cits:
+                        st.markdown(
+                            f"[^{c.get('ref_num')}] **{c.get('source_name','')}** "
+                            f"(chunk {c.get('chunk_index')}, score {c.get('score',0):.3f})  \n"
+                            f"`{c.get('source_path','')}`"
+                        )
+                        ex = c.get("excerpt")
+                        if ex:
+                            with st.expander(f"Excerpt [^{c.get('ref_num')}]"):
+                                st.write(ex)
+
+                st.write("### Retrieval")
+                st.json(res.get("retrieval", {}))
+
+            except Exception as e:
+                st.error(f"Request error: {e}")
+
+st.caption("Strict mode answers ONLY from retrieved sources; otherwise it says “I don't know based on the provided sources.”")
+
+# ---------------- Inspect Qdrant ----------------
+st.subheader("Inspect Qdrant collection")
+
+i1, i2 = st.columns([1, 3])
+with i1:
+    sample_n = st.number_input("Sample points", min_value=1, max_value=100, value=5)
+    filename_filter = st.text_input("Filter by source_name (optional)", value="")
+run_inspect = st.button("Show sample")
+
+if run_inspect:
+    try:
+        # Backend helper endpoint (see API patch below)
+        payload = {"limit": int(sample_n), "with_payload": True, "with_vectors": False}
+        if filename_filter.strip():
+            payload["filter"] = {
+                "must": [{"key": "source_name", "match": {"value": filename_filter.strip()}}]
+            }
+        r = requests.post(f"{API_URL}/qdrant_scroll", json=payload, timeout=30)
+        if r.status_code == 404:
+            st.error("`/qdrant_scroll` not found on API. Add the small helper endpoint in the API.")
+        else:
+            r.raise_for_status()
+            data = r.json()
+            st.write("### Sample payloads")
+            st.json(data)
+    except Exception as e:
+        st.error(e)
+
+# ---------------- (Optional) Per-file counts ----------------
+st.subheader("Per-file counts (top 20)")
+if st.button("Compute counts"):
+    try:
+        r = requests.post(f"{API_URL}/qdrant_counts_by_source", json={}, timeout=120)
+        if r.status_code == 404:
+            st.error("`/qdrant_counts_by_source` not found on API. Add the helper endpoint in the API.")
+        else:
+            r.raise_for_status()
+            data = r.json()
+            st.dataframe(data)
+    except Exception as e:
+        st.error(e)

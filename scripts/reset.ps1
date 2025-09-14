@@ -56,7 +56,7 @@ if ($Seed) {
     --env QDRANT_URL=http://qdrant:6333 `
     --env OLLAMA_URL=http://ollama:11434 `
     --env EMBED_MODEL=nomic-embed-text `
-    --env QDRANT_COLLECTION=regdocs_v1 `
+    b--env QDRANT_COLLECTION=regdocs_v1 `
     api python /workspace/seed_qdrant.py
   if ($LASTEXITCODE -eq 0) { Ok "Seeding completed" } else { Die "Seeding failed" }
 }

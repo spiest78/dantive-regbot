@@ -25,13 +25,14 @@ except ImportError:  # pragma: no cover
 # ---------- Config ----------
 DATA_DIR = os.getenv("DATA_DIR", "./data")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")   # if running inside Docker network
-# If running on your host, you may need "http://localhost:6333"
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")  # or "http://localhost:11434"
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")   # 768-d
 COLLECTION = os.getenv("QDRANT_COLLECTION", "regdocs_v1")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))            # ~ characters
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "64"))
+# Optional: cap pages for problematic PDFs (0 = no cap)
+MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "0"))
 # ----------------------------
 
 # --- Helpers ---
@@ -41,36 +42,55 @@ def read_text_from_file(path: str) -> str:
     if lower.endswith(".txt"):
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             return f.read()
+
     if lower.endswith(".pdf"):
         try:
             from pypdf import PdfReader
         except ImportError as e:
             raise RuntimeError("pypdf is required for PDFs. Install with: pip install pypdf") from e
+
         reader = PdfReader(path)
+        n_pages = len(reader.pages)
+        if MAX_PDF_PAGES and n_pages > MAX_PDF_PAGES:
+            n_pages = MAX_PDF_PAGES  # soft cap if you set it via env
+
         texts = []
-        for page in reader.pages:
-            t = page.extract_text() or ""
+        bar = tqdm(range(n_pages), desc=f"PDF read: {os.path.basename(path)}", unit="page")
+        for i in bar:
+            try:
+                page = reader.pages[i]
+                t = page.extract_text() or ""
+            except Exception as e:
+                t = ""  # skip unreadable page but keep going
             texts.append(t)
         return "\n".join(texts)
+
     raise RuntimeError(f"Unsupported file type: {path}")
 
 def normalize_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 def chunk_text(text: str, size: int, overlap: int) -> List[str]:
+    if size <= 0:
+        raise ValueError("CHUNK_SIZE must be > 0")
+    if overlap < 0:
+        raise ValueError("CHUNK_OVERLAP must be >= 0")
+    if overlap >= size:
+        # Overlap must be strictly smaller than size to make forward progress
+        raise ValueError("CHUNK_OVERLAP must be < CHUNK_SIZE")
+
     text = normalize_ws(text)
     chunks = []
-    start = 0
     n = len(text)
+    start = 0
+
     while start < n:
         end = min(start + size, n)
-        chunk = text[start:end]
-        chunks.append(chunk)
-        start = end - overlap
-        if start < 0:
-            start = 0
-        if start >= n:
+        chunks.append(text[start:end])
+        if end == n:          # ✅ we're at the end; stop
             break
+        start = max(end - overlap, 0)  # always move forward
+
     return chunks
 
 def file_sha1(path: str) -> str:
@@ -81,6 +101,7 @@ def file_sha1(path: str) -> str:
     return h.hexdigest()
 
 def ensure_collection(client: QdrantClient, collection: str, vector_size: int = 768, distance="Cosine"):
+    # Prefer idempotent create if not exists
     try:
         client.get_collection(collection_name=collection)
         return
@@ -92,7 +113,6 @@ def ensure_collection(client: QdrantClient, collection: str, vector_size: int = 
     )
 
 def guess_vector_size_for_model(name: str) -> int:
-    # Known defaults for common Ollama embed models
     table = {
         "nomic-embed-text": 768,
         "mxbai-embed-large": 1024,
@@ -142,48 +162,39 @@ def main():
 
     files = scan_files(DATA_DIR)
     if not files:
-        print(f"No files found in {DATA_DIR}. Add PDFs or TXTs and re-run.")
+        print(f"No files found in {DATA_DIR}. Add PDFs or TXTs and re-run.", flush=True)
         return
 
-    print(f"Found {len(files)} files under {DATA_DIR}. Embedding with {EMBED_MODEL} via {OLLAMA_URL}")
+    print(f"Found {len(files)} files under {DATA_DIR}. Embedding with {EMBED_MODEL} via {OLLAMA_URL}", flush=True)
 
     # -------- First pass: read & chunk so we know total work --------
-    file_chunks = []
+    file_chunks = []  # list[(path, [chunks])]
     total_chunks = 0
     read_start = time.time()
+
     for path in files:
-        print(f"[READ] {path}")  # 👈 add this line
+        print(f"[READ] {path}", flush=True)
         try:
             text = read_text_from_file(path)
         except Exception as e:
-            print(f"[SKIP] {path}: {e}")
+            print(f"[SKIP] {path}: {e}", flush=True)
             continue
+
         chunks = chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
         if not chunks:
-            print(f"[SKIP] {path}: no text extracted")
+            print(f"[SKIP] {path}: no text extracted", flush=True)
             continue
+
         file_chunks.append((path, chunks))
         total_chunks += len(chunks)
-    read_start = time.time()
-    for path in files:
-        try:
-            text = read_text_from_file(path)
-        except Exception as e:
-            print(f"[SKIP] {path}: {e}")
-            continue
-        chunks = chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
-        if not chunks:
-            print(f"[SKIP] {path}: no text extracted")
-            continue
-        file_chunks.append((path, chunks))
-        total_chunks += len(chunks)
+
     read_elapsed = time.time() - read_start
 
     if total_chunks == 0:
-        print("No chunks to embed. Exiting.")
+        print("No chunks to embed. Exiting.", flush=True)
         return
 
-    print(f"Prepared {total_chunks} chunks from {len(file_chunks)} files in {format_duration(read_elapsed)}.")
+    print(f"Prepared {total_chunks} chunks from {len(file_chunks)} files in {format_duration(read_elapsed)}.", flush=True)
 
     # -------- Second pass: embed + upsert with global progress/ETA --------
     global_start = time.time()
@@ -194,7 +205,7 @@ def main():
     for path, chunks in file_chunks:
         file_start = time.time()
         vectors = []
-        # per-file progress (lightweight; avoid nested bars)
+
         for chunk in chunks:
             vec = embed_text(chunk, EMBED_MODEL, OLLAMA_URL)
             vectors.append(vec)
@@ -225,18 +236,14 @@ def main():
                 "file_sha1": sha1,
                 "chunk_index": idx,
                 "created_at": now,
-                # Extend with regulatory metadata if you want
-                # "regulation": "REACH",
-                # "article": "57",
-                # "language": "en",
+                "text": chunk[:1200],  # enable excerpts in API responses
             }
             points.append(qmodels.PointStruct(id=pid, vector=vec, payload=payload))
 
         upsert_batches(client, COLLECTION, points, BATCH_SIZE)
         total_points += len(points)
-
         rate_file = len(chunks) / file_elapsed if file_elapsed > 0 else 0.0
-        print(f"[OK] {path}: {len(points)} chunks upserted in {format_duration(file_elapsed)} ({rate_file:.1f} ch/s)")
+        print(f"[OK] {path}: {len(points)} chunks upserted in {format_duration(file_elapsed)} ({rate_file:.1f} ch/s)", flush=True)
 
     pbar.close()
     total_elapsed = time.time() - global_start
@@ -244,15 +251,15 @@ def main():
     info = client.get_collection(COLLECTION)
     approx_count = client.count(COLLECTION, exact=False).count
 
-    print("\nDone.")
-    print(f"Collection: {COLLECTION}")
-    print(f"Status: {info.status}, vectors count (approx): {approx_count}")
-    print(f"Total upserted this run: {total_points}")
+    print("\nDone.", flush=True)
+    print(f"Collection: {COLLECTION}", flush=True)
+    print(f"Status: {info.status}, vectors count (approx): {approx_count}", flush=True)
+    print(f"Total upserted this run: {total_points}", flush=True)
     rate_global = total_chunks / total_elapsed if total_elapsed > 0 else 0.0
-    print(f"Total embedding time: {format_duration(total_elapsed)} ({rate_global:.1f} chunks/sec)")
+    print(f"Total embedding time: {format_duration(total_elapsed)} ({rate_global:.1f} chunks/sec)", flush=True)
     remaining = total_chunks - processed
     if remaining > 0:
-        print(f"⚠️  Warning: {remaining} chunks unprocessed.")
+        print(f"⚠️  Warning: {remaining} chunks unprocessed.", flush=True)
 
 if __name__ == "__main__":
     main()
