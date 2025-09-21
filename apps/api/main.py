@@ -11,7 +11,7 @@ import psycopg
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels  # For Filter, etc.
 
-app = FastAPI(title="Dantive Regulatory Bot API", version="0.3.3")
+app = FastAPI(title="Dantive Regulatory Bot API", version="0.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,18 +23,22 @@ app.add_middleware(
 DATABASE_URL = os.getenv("DATABASE_URL")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
-DEFAULT_MODEL = os.getenv("OLLAMA_DEFAULT_MODEL", "mistral:7b-instruct")
+
+# Model defaults
+DEFAULT_MODEL = os.getenv("OLLAMA_DEFAULT_MODEL", os.getenv("GEN_MODEL", "mistral:7b-instruct"))
 COLLECTION = os.getenv("QDRANT_COLLECTION") or "regdocs_v1"
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
 
-# Strict RAG policy (Dantive: compliance + transparency)
-RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.82"))
+# RAG knobs (defaults intentionally relaxed for bring-up)
+RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.0"))   # ← relaxed default; .env can tighten
 RAG_MIN_DOCS_REQUIRED = int(os.getenv("RAG_MIN_DOCS_REQUIRED", "1"))
-RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
-RAG_TEMPERATURE = float(os.getenv("RAG_TEMPERATURE", "0.1"))
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "8"))
+RAG_TEMPERATURE = float(os.getenv("RAG_TEMPERATURE", os.getenv("GEN_TEMPERATURE", "0.1")))
 RAG_MAX_CHARS = int(os.getenv("RAG_MAX_CHARS", "900"))
 
-# Raw endpoints gate (default OFF)
+# Debug/behavior flags
+RAG_DEBUG = os.getenv("RAG_DEBUG", "true").lower() == "true"            # show more info; bypass hard filters
+RAG_FORCE_ANSWER = os.getenv("RAG_FORCE_ANSWER", "true").lower() == "true"  # try to answer even with thin context
 ALLOW_RAW = os.getenv("ALLOW_RAW", "false").lower() == "true"
 
 # Timeouts (seconds)
@@ -83,6 +87,8 @@ def health():
         "min_docs": RAG_MIN_DOCS_REQUIRED,
         "top_k": RAG_TOP_K,
         "temperature": RAG_TEMPERATURE,
+        "debug": RAG_DEBUG,
+        "force_answer": RAG_FORCE_ANSWER,
     }
     ok["allow_raw"] = ALLOW_RAW
     return ok
@@ -90,7 +96,7 @@ def health():
 
 @app.get("/")
 def root():
-    return {"message": "Dantive Regulatory Bot API — strict RAG (no hallucinations) with citations."}
+    return {"message": "Dantive Regulatory Bot API — RAG with debug mode and citations."}
 
 
 # ——— Shared request model
@@ -127,6 +133,7 @@ def _build_payload(
         },
     }
     if max_tokens:
+        # Ollama uses "num_predict" for max generated tokens
         payload["options"]["num_predict"] = max_tokens
     return payload
 
@@ -189,7 +196,7 @@ if ALLOW_RAW:
         return StreamingResponse(gen(), media_type="text/plain")
 
 
-# ——— STRICT RAG
+# ——— STRICT/RELAXED RAG
 class Citation(BaseModel):
     ref_num: int
     source_name: Optional[str]
@@ -248,6 +255,9 @@ def retrieve(vec: List[float]) -> List[dict]:
 
 
 def eligible(results: List[dict]) -> List[dict]:
+    """In debug mode, do not filter by score to ensure we always pass something through."""
+    if RAG_DEBUG:
+        return results
     return [r for r in results if r["score"] >= RAG_MIN_SCORE]
 
 
@@ -263,7 +273,7 @@ def build_sources_block(els: List[dict]) -> str:
     return "\n".join(lines)
 
 
-def system_prompt(user_q: str, sources_block: str) -> str:
+def strict_system_prompt(user_q: str, sources_block: str) -> str:
     return f"""You are Dantive RegBot. Compliance & transparency first.
 
 Rules:
@@ -284,8 +294,30 @@ Citations: [^n], [^m] ...
 """
 
 
-def call_ollama_strict(prompt: str, model: str) -> str:
-    # IMPORTANT: force non-stream to get a single JSON object
+def relaxed_system_prompt(user_q: str, sources_block: str) -> str:
+    return f"""You are Dantive RegBot. Use the SOURCES if possible. If the SOURCES look thin or partial,
+still provide a brief best-effort answer and clearly mark uncertainty.
+
+Always include footnote-style citations [^n] for any statements based on SOURCES.
+If you needed to go beyond SOURCES, add: "(Context may be insufficient)".
+
+User question:
+{user_q}
+
+SOURCES (numbered):
+{sources_block}
+
+Respond in this format:
+Answer: <your answer>
+Citations: [^n], [^m] ... (or "none")
+"""
+
+
+def system_prompt(user_q: str, sources_block: str) -> str:
+    return relaxed_system_prompt(user_q, sources_block) if RAG_FORCE_ANSWER else strict_system_prompt(user_q, sources_block)
+
+
+def call_ollama_nonstream(prompt: str, model: str) -> str:
     payload = {
         "model": model,
         "prompt": prompt,
@@ -297,7 +329,7 @@ def call_ollama_strict(prompt: str, model: str) -> str:
 
 @app.post("/ask", response_model=AskResponseRAG)
 def ask_rag(req: AskBase):
-    """Strict RAG endpoint: refuses to answer if retrieval is weak; always returns citations."""
+    """RAG endpoint: when RAG_FORCE_ANSWER=true it will attempt best-effort answers with uncertainty markers."""
     model = req.model or DEFAULT_MODEL
     question = req.prompt.strip()
 
@@ -306,13 +338,19 @@ def ask_rag(req: AskBase):
     results = retrieve(vec)
     els = eligible(results)[:RAG_TOP_K]
 
-    # 2) Guardrail: no strong matches => refuse to answer
-    if len(els) < RAG_MIN_DOCS_REQUIRED:
+    # 2) Guardrail (strict mode only): no strong matches => refuse to answer
+    if not RAG_FORCE_ANSWER and len([r for r in results if r["score"] >= RAG_MIN_SCORE]) < max(1, RAG_MIN_DOCS_REQUIRED):
         return AskResponseRAG(
             model=model,
             answer='I don\'t know based on the provided sources.',
             citations=[],
-            retrieval={"top_k": RAG_TOP_K, "min_score": RAG_MIN_SCORE, "used": 0, "total_found": len(results)},
+            retrieval={
+                "top_k": RAG_TOP_K,
+                "min_score": RAG_MIN_SCORE,
+                "used": 0,
+                "total_found": len(results),
+                "raw": results if RAG_DEBUG else None,
+            },
             policy={"answered": False, "reason": "no_relevant_documents_above_threshold"},
         )
 
@@ -321,7 +359,7 @@ def ask_rag(req: AskBase):
     prompt = system_prompt(question, sources_block)
 
     # 4) Generate
-    answer = call_ollama_strict(prompt, model=model)
+    answer = call_ollama_nonstream(prompt, model=model)
 
     # 5) Structure citations aligned with [^n]
     cits: List[Citation] = []
@@ -341,17 +379,22 @@ def ask_rag(req: AskBase):
         model=model,
         answer=answer,
         citations=cits,
-        retrieval={"top_k": RAG_TOP_K, "min_score": RAG_MIN_SCORE, "used": len(els), "total_found": len(results)},
-        policy={"answered": True, "reason": "sufficient_retrieval"},
+        retrieval={
+            "top_k": RAG_TOP_K,
+            "min_score": RAG_MIN_SCORE,
+            "used": len(els),
+            "total_found": len(results),
+            "raw": results if RAG_DEBUG else None,
+        },
+        policy={"answered": True, "reason": "sufficient_retrieval" if els else "best_effort_with_uncertainty"},
     )
 
 
-# ——— Streaming RAG (guardrails + streaming)
+# ——— Streaming RAG (keeps the same semantics)
 @app.post("/ask_stream_rag")
 def ask_stream_rag(req: AskBase):
     """
-    Streams text with strict RAG guardrail.
-    If retrieval is weak, immediately yields the no-answer line and stops.
+    Streams text. If RAG_FORCE_ANSWER is False and retrieval is weak, yields the no-answer line and stops.
     """
     model = req.model or DEFAULT_MODEL
     question = req.prompt.strip()
@@ -361,15 +404,15 @@ def ask_stream_rag(req: AskBase):
     results = retrieve(vec)
     els = eligible(results)[:RAG_TOP_K]
 
-    if len(els) < RAG_MIN_DOCS_REQUIRED:
+    if not RAG_FORCE_ANSWER and len([r for r in results if r["score"] >= RAG_MIN_SCORE]) < max(1, RAG_MIN_DOCS_REQUIRED):
         return StreamingResponse(iter(["I don't know based on the provided sources."]), media_type="text/plain")
 
     sources_block = build_sources_block(els)
-    prompt = system_prompt(question, sources_block)
+    sprompt = system_prompt(question, sources_block)
 
     payload = {
         "model": model,
-        "prompt": prompt,
+        "prompt": sprompt,
         "stream": True,  # explicit streaming for NDJSON
         "options": {"temperature": RAG_TEMPERATURE},
     }
@@ -474,3 +517,38 @@ def qdrant_counts_by_source():
         if not next_off:
             break
     return [{"source_name": k, "count": v} for k, v in agg.most_common(100)]
+
+
+# ——— NEW: Retrieve-only endpoint (proves retrieval is working without the LLM)
+@app.get("/debug/retrieve")
+def debug_retrieve(qtext: str, top_k: int = 10):
+    """
+    Embeds qtext via Ollama and directly queries Qdrant. Ignores score thresholds.
+    Returns id-less summaries suitable for debugging.
+    """
+    try:
+        # embed
+        er = requests.post(
+            f"{OLLAMA_URL}/api/embeddings",
+            json={"model": EMBED_MODEL, "prompt": qtext},
+            timeout=(OLLAMA_CONNECT_TIMEOUT, OLLAMA_READ_TIMEOUT),
+        )
+        er.raise_for_status()
+        vec = er.json()["embedding"]
+
+        # search
+        hits = qdrant.search(collection_name=COLLECTION, query_vector=vec, limit=top_k, with_payload=True)
+        out = []
+        for h in hits:
+            p = h.payload or {}
+            txt = (p.get("text") or "")[:RAG_MAX_CHARS]
+            out.append({
+                "score": float(h.score),
+                "source_name": p.get("source_name"),
+                "source_path": p.get("source_path"),
+                "chunk_index": p.get("chunk_index"),
+                "snippet": txt
+            })
+        return {"query": qtext, "top_k": top_k, "results": out}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"debug_retrieve failed: {e}")

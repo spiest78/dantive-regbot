@@ -10,7 +10,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # Persist Postgres on the Runpod Network Volume
+      - /workspace/postgres:/var/lib/postgresql/data
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
     ports:
       - "5432:5432"
@@ -26,24 +27,29 @@ services:
     ports:
       - "${QDRANT_PORT}:6333"
     volumes:
-      - qdrant_storage:/qdrant/storage
-      # healthcheck:  # <-- comment this whole block for now
-      #   test: ["CMD", "/qdrant/healthcheck"]
-      #   interval: 5s
-      #   timeout: 5s
-      #   retries: 30
+      # Persist Qdrant storage on the Network Volume
+      - /workspace/qdrant:/qdrant/storage
+    # Keeping simple start dependency (Qdrant boots fast)
+    # healthcheck:
+    #   test: ["CMD", "/qdrant/healthcheck"]
+    #   interval: 5s
+    #   timeout: 5s
+    #   retries: 30
 
   ollama:
     image: ollama/ollama:0.3.12
     restart: unless-stopped
+    # === GPU on Runpod ===
+    runtime: nvidia
     environment:
-      OLLAMA_KEEP_ALIVE: "24h"
-      # No proxy here; the server only listens and serves locally
-      # OLLAMA_HOST default is fine; healthcheck uses localhost
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      OLLAMA_KEEP_ALIVE: "30m"
     ports:
       - "${OLLAMA_PORT}:11434"
     volumes:
-      - models_cache:/root/.ollama
+      # Persist models on the Network Volume (fast next boots)
+      - /workspace/ollama:/root/.ollama
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 10s
@@ -56,19 +62,19 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
+    env_file: .env                 # <-- read OLLAMA_MODELS from .env
     environment:
       OLLAMA_HOST: http://ollama:11434
-      # Use the real Docker Desktop magic hostname:
-      HTTP_PROXY:  http://host.docker.internal:3128
-      HTTPS_PROXY: http://host.docker.internal:3128
-      # Bypass proxy for in-cluster/localhost targets
-      NO_PROXY: "localhost,127.0.0.1,api,db,qdrant,ollama,0.0.0.0"
     volumes:
-      - models_cache:/root/.ollama
+      - /workspace/ollama:/root/.ollama
     entrypoint: ["/bin/sh","-lc"]
-    command: >
-      "ollama pull mistral:7b-instruct || true &&
-      ollama pull nomic-embed-text || true"
+    command: |
+      models="${OLLAMA_MODELS:-mistral:7b-instruct,nomic-embed-text}";
+      IFS=,;
+      for m in $models; do
+        echo "Pulling $m";
+        ollama pull "$m" || true;
+      done
 
   api:
     build:
@@ -79,8 +85,8 @@ services:
       db:
         condition: service_healthy
       qdrant:
-        condition: service_started   # <-- was service_healthy
-      # remove ollama dep for now
+        condition: service_started
+      # no hard dep on ollama (API can lazy-connect)
     env_file: .env
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
@@ -89,7 +95,7 @@ services:
       OLLAMA_DEFAULT_MODEL: mistral:7b-instruct
       OLLAMA_CONNECT_TIMEOUT: "10"
       OLLAMA_READ_TIMEOUT: "600"
-      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-regdocs_v1} 
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-regdocs_v1}
     working_dir: /workspace/apps/api
     volumes:
       - ..:/workspace
@@ -105,7 +111,7 @@ services:
 
   ui:
     build:
-      context: ../apps/ui  
+      context: ../apps/ui
       dockerfile: Dockerfile
     restart: unless-stopped
     depends_on:
@@ -126,8 +132,3 @@ services:
       interval: 5s
       timeout: 5s
       retries: 30
-
-volumes:
-  pgdata:
-  qdrant_storage:
-  models_cache:
