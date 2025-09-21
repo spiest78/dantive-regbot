@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Generator
 import os
 import json
 import requests
@@ -11,7 +11,7 @@ import psycopg
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels  # For Filter, etc.
 
-app = FastAPI(title="Dantive Regulatory Bot API", version="0.3.2")
+app = FastAPI(title="Dantive Regulatory Bot API", version="0.3.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,7 +24,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 DEFAULT_MODEL = os.getenv("OLLAMA_DEFAULT_MODEL", "mistral:7b-instruct")
-COLLECTION = os.getenv("QDRANT_COLLECTION", "regdocs_v1")
+COLLECTION = os.getenv("QDRANT_COLLECTION") or "regdocs_v1"
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
 
 # Strict RAG policy (Dantive: compliance + transparency)
@@ -43,6 +43,7 @@ OLLAMA_READ_TIMEOUT = int(os.getenv("OLLAMA_READ_TIMEOUT", "600"))
 
 # Clients
 qdrant = QdrantClient(url=QDRANT_URL, prefer_grpc=False)
+
 
 # ——— Health
 @app.get("/health")
@@ -86,9 +87,11 @@ def health():
     ok["allow_raw"] = ALLOW_RAW
     return ok
 
+
 @app.get("/")
 def root():
     return {"message": "Dantive Regulatory Bot API — strict RAG (no hallucinations) with citations."}
+
 
 # ——— Shared request model
 class AskBase(BaseModel):
@@ -99,41 +102,59 @@ class AskBase(BaseModel):
     top_p: Optional[float] = Field(None, ge=0.0, le=1.0)
     max_tokens: Optional[int] = Field(None, ge=1)
 
-# ——— RAW (optional, gated) ——————————————————————————————————
+
+# ——— RAW (optional, gated)
 class AskResponseRaw(BaseModel):
     model: str
     output: str
 
-def _build_payload(prompt: str, model: str, temperature: Optional[float], top_p: Optional[float], max_tokens: Optional[int], stream: bool) -> dict:
+
+def _build_payload(
+    prompt: str,
+    model: str,
+    temperature: Optional[float],
+    top_p: Optional[float],
+    max_tokens: Optional[int],
+    stream: bool,
+) -> dict:
     payload: Dict[str, Any] = {
         "model": model,
         "prompt": prompt,
-        "stream": stream,
+        "stream": stream,  # IMPORTANT: explicit to avoid NDJSON surprises
         "options": {
-            "temperature": temperature if temperature is not None else 0.2,
-            "top_p": top_p if top_p is not None else 0.9,
+            "temperature": RAG_TEMPERATURE if temperature is None else temperature,
+            "top_p": 0.9 if top_p is None else top_p,
         },
     }
     if max_tokens:
         payload["options"]["num_predict"] = max_tokens
     return payload
 
-def call_ollama_raw(prompt: str, model: str, temperature: Optional[float], top_p: Optional[float], max_tokens: Optional[int]) -> str:
-    payload = _build_payload(prompt, model, temperature, top_p, max_tokens, stream=False)
-    r = requests.post(
-        f"{OLLAMA_URL}/api/generate",
-        json=payload,
-        timeout=(OLLAMA_CONNECT_TIMEOUT, OLLAMA_READ_TIMEOUT),
-    )
-    r.raise_for_status()
-    data = r.json()
-    return data.get("response", "")
+
+def _ollama_nonstream(payload: dict) -> str:
+    try:
+        r = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json=payload,
+            timeout=(OLLAMA_CONNECT_TIMEOUT, OLLAMA_READ_TIMEOUT),
+        )
+        r.raise_for_status()
+        # must be a single JSON object
+        data = r.json()
+        return (data.get("response") or "").strip()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Ollama request failed: {e}")
+    except json.JSONDecodeError as e:
+        # This happens if Ollama streamed (NDJSON) unexpectedly
+        raise HTTPException(status_code=502, detail=f"Ollama returned non-JSON (stream?) for non-stream request: {e}")
+
 
 if ALLOW_RAW:
     @app.post("/ask_raw", response_model=AskResponseRaw)
     def ask_raw(req: AskBase):
         model = req.model or DEFAULT_MODEL
-        out = call_ollama_raw(req.prompt, model, req.temperature, req.top_p, req.max_tokens)
+        payload = _build_payload(req.prompt, model, req.temperature, req.top_p, req.max_tokens, stream=False)
+        out = _ollama_nonstream(payload)
         return AskResponseRaw(model=model, output=out)
 
     @app.post("/ask_stream")
@@ -141,7 +162,7 @@ if ALLOW_RAW:
         model = req.model or DEFAULT_MODEL
         payload = _build_payload(req.prompt, model, req.temperature, req.top_p, req.max_tokens, stream=True)
 
-        def gen():
+        def gen() -> Generator[str, None, None]:
             try:
                 with requests.post(
                     f"{OLLAMA_URL}/api/generate",
@@ -160,13 +181,15 @@ if ALLOW_RAW:
                             if j.get("done"):
                                 break
                         except json.JSONDecodeError:
+                            # Pass through raw line if it isn't JSON (rare)
                             yield line
             except requests.exceptions.RequestException as e:
                 yield f"\n[stream error: {e}]"
 
         return StreamingResponse(gen(), media_type="text/plain")
 
-# ——— STRICT RAG ——————————————————————————————————————————
+
+# ——— STRICT RAG
 class Citation(BaseModel):
     ref_num: int
     source_name: Optional[str]
@@ -175,6 +198,7 @@ class Citation(BaseModel):
     score: float
     excerpt: Optional[str] = None
 
+
 class AskResponseRAG(BaseModel):
     model: str
     answer: str
@@ -182,34 +206,50 @@ class AskResponseRAG(BaseModel):
     retrieval: dict
     policy: dict
 
+
 def embed_query(q: str) -> List[float]:
-    r = requests.post(
-        f"{OLLAMA_URL}/api/embeddings",
-        json={"model": EMBED_MODEL, "prompt": q},
-        timeout=(OLLAMA_CONNECT_TIMEOUT, OLLAMA_READ_TIMEOUT),
-    )
-    r.raise_for_status()
-    return r.json()["embedding"]
+    try:
+        r = requests.post(
+            f"{OLLAMA_URL}/api/embeddings",
+            json={"model": EMBED_MODEL, "prompt": q},
+            timeout=(OLLAMA_CONNECT_TIMEOUT, OLLAMA_READ_TIMEOUT),
+        )
+        r.raise_for_status()
+        j = r.json()
+        return j["embedding"]
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Embedding request failed: {e}")
+    except (KeyError, ValueError, json.JSONDecodeError) as e:
+        raise HTTPException(status_code=502, detail=f"Embedding response malformed: {e}")
+
 
 def retrieve(vec: List[float]) -> List[dict]:
-    hits = qdrant.search(collection_name=COLLECTION, query_vector=vec, limit=RAG_TOP_K)
+    try:
+        hits = qdrant.search(collection_name=COLLECTION, query_vector=vec, limit=RAG_TOP_K)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Vector search failed: {e}")
+
     results = []
     for h in hits:
         p = h.payload or {}
         txt = p.get("text")
         if txt:
             txt = txt[:RAG_MAX_CHARS]
-        results.append({
-            "score": float(h.score),
-            "source_name": p.get("source_name"),
-            "source_path": p.get("source_path"),
-            "chunk_index": p.get("chunk_index"),
-            "text": txt,
-        })
+        results.append(
+            {
+                "score": float(h.score),
+                "source_name": p.get("source_name"),
+                "source_path": p.get("source_path"),
+                "chunk_index": p.get("chunk_index"),
+                "text": txt,
+            }
+        )
     return results
+
 
 def eligible(results: List[dict]) -> List[dict]:
     return [r for r in results if r["score"] >= RAG_MIN_SCORE]
+
 
 def build_sources_block(els: List[dict]) -> str:
     if not els:
@@ -221,6 +261,7 @@ def build_sources_block(els: List[dict]) -> str:
         else:
             lines.append(f"[{i}] (from {r.get('source_name')} chunk #{r.get('chunk_index')})")
     return "\n".join(lines)
+
 
 def system_prompt(user_q: str, sources_block: str) -> str:
     return f"""You are Dantive RegBot. Compliance & transparency first.
@@ -242,14 +283,17 @@ Answer: <your answer>
 Citations: [^n], [^m] ...
 """
 
+
 def call_ollama_strict(prompt: str, model: str) -> str:
-    r = requests.post(
-        f"{OLLAMA_URL}/api/generate",
-        json={"model": model, "prompt": prompt, "options": {"temperature": RAG_TEMPERATURE}},
-        timeout=(OLLAMA_CONNECT_TIMEOUT, OLLAMA_READ_TIMEOUT),
-    )
-    r.raise_for_status()
-    return r.json().get("response", "").strip()
+    # IMPORTANT: force non-stream to get a single JSON object
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": RAG_TEMPERATURE},
+    }
+    return _ollama_nonstream(payload)
+
 
 @app.post("/ask", response_model=AskResponseRAG)
 def ask_rag(req: AskBase):
@@ -266,7 +310,7 @@ def ask_rag(req: AskBase):
     if len(els) < RAG_MIN_DOCS_REQUIRED:
         return AskResponseRAG(
             model=model,
-            answer="I don't know based on the provided sources.",
+            answer='I don\'t know based on the provided sources.',
             citations=[],
             retrieval={"top_k": RAG_TOP_K, "min_score": RAG_MIN_SCORE, "used": 0, "total_found": len(results)},
             policy={"answered": False, "reason": "no_relevant_documents_above_threshold"},
@@ -282,14 +326,16 @@ def ask_rag(req: AskBase):
     # 5) Structure citations aligned with [^n]
     cits: List[Citation] = []
     for i, r in enumerate(els, start=1):
-        cits.append(Citation(
-            ref_num=i,
-            source_name=r.get("source_name"),
-            source_path=r.get("source_path"),
-            chunk_index=r.get("chunk_index"),
-            score=r["score"],
-            excerpt=r.get("text"),
-        ))
+        cits.append(
+            Citation(
+                ref_num=i,
+                source_name=r.get("source_name"),
+                source_path=r.get("source_path"),
+                chunk_index=r.get("chunk_index"),
+                score=r["score"],
+                excerpt=r.get("text"),
+            )
+        )
 
     return AskResponseRAG(
         model=model,
@@ -299,7 +345,8 @@ def ask_rag(req: AskBase):
         policy={"answered": True, "reason": "sufficient_retrieval"},
     )
 
-# ——— Streaming RAG (guardrails + streaming) ————————————
+
+# ——— Streaming RAG (guardrails + streaming)
 @app.post("/ask_stream_rag")
 def ask_stream_rag(req: AskBase):
     """
@@ -308,28 +355,32 @@ def ask_stream_rag(req: AskBase):
     """
     model = req.model or DEFAULT_MODEL
     question = req.prompt.strip()
+
+    # Retrieval first (non-streaming paths)
     vec = embed_query(question)
     results = retrieve(vec)
     els = eligible(results)[:RAG_TOP_K]
+
     if len(els) < RAG_MIN_DOCS_REQUIRED:
         return StreamingResponse(iter(["I don't know based on the provided sources."]), media_type="text/plain")
 
     sources_block = build_sources_block(els)
     prompt = system_prompt(question, sources_block)
+
     payload = {
         "model": model,
         "prompt": prompt,
-        "stream": True,
-        "options": {"temperature": RAG_TEMPERATURE}
+        "stream": True,  # explicit streaming for NDJSON
+        "options": {"temperature": RAG_TEMPERATURE},
     }
 
-    def gen():
+    def gen() -> Generator[str, None, None]:
         try:
             with requests.post(
                 f"{OLLAMA_URL}/api/generate",
                 json=payload,
                 stream=True,
-                timeout=(OLLAMA_CONNECT_TIMEOUT, OLLAMA_READ_TIMEOUT)
+                timeout=(OLLAMA_CONNECT_TIMEOUT, OLLAMA_READ_TIMEOUT),
             ) as r:
                 r.raise_for_status()
                 for line in r.iter_lines(decode_unicode=True):
@@ -342,13 +393,15 @@ def ask_stream_rag(req: AskBase):
                         if j.get("done"):
                             break
                     except json.JSONDecodeError:
+                        # Pass-through any occasional non-JSON line
                         yield line
         except requests.exceptions.RequestException as e:
             yield f"\n[stream error: {e}]"
 
     return StreamingResponse(gen(), media_type="text/plain")
 
-# ——— Qdrant debug helpers ——————————————————————————————
+
+# ——— Qdrant debug helpers
 @app.post("/qdrant_scroll")
 def qdrant_scroll(body: dict = Body(...)):
     """
@@ -397,12 +450,14 @@ def qdrant_scroll(body: dict = Body(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"qdrant_scroll failed: {e}")
 
+
 @app.post("/qdrant_counts_by_source")
 def qdrant_counts_by_source():
     """
     Returns [{source_name, count}] for up to the whole collection (batched scroll).
     """
     import collections
+
     agg = collections.Counter()
     next_off = None
     while True:
@@ -411,7 +466,7 @@ def qdrant_counts_by_source():
             limit=1000,
             offset=next_off,
             with_payload=True,
-            with_vectors=False
+            with_vectors=False,
         )
         for p in points:
             sn = (p.payload or {}).get("source_name", "<unknown>")

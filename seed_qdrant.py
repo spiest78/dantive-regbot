@@ -2,7 +2,7 @@ import os
 import time
 import hashlib
 import re
-from typing import List
+from typing import List, Set, Optional
 
 import requests
 from qdrant_client import QdrantClient
@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover
             self.iterable = iterable
         def update(self, n=1): pass
         def close(self): pass
+        def set_description(self, *_args, **_kwargs): pass
         def __iter__(self):
             if self.iterable is None:
                 return iter([])
@@ -33,6 +34,11 @@ CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "64"))
 # Optional: cap pages for problematic PDFs (0 = no cap)
 MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "0"))
+# Resume: skip already-present chunks (by file_sha1 + chunk_index)
+RESUME = os.getenv("RESUME", "true").lower() == "true"
+# Simple retries for Ollama embeddings
+EMBED_MAX_RETRIES = int(os.getenv("EMBED_MAX_RETRIES", "3"))
+EMBED_RETRY_BACKOFF = float(os.getenv("EMBED_RETRY_BACKOFF", "1.5"))
 # ----------------------------
 
 # --- Helpers ---
@@ -50,8 +56,9 @@ def read_text_from_file(path: str) -> str:
             raise RuntimeError("pypdf is required for PDFs. Install with: pip install pypdf") from e
 
         reader = PdfReader(path)
-        n_pages = len(reader.pages)
-        if MAX_PDF_PAGES and n_pages > MAX_PDF_PAGES:
+        total_pages = len(reader.pages)
+        n_pages = total_pages
+        if MAX_PDF_PAGES and total_pages > MAX_PDF_PAGES:
             n_pages = MAX_PDF_PAGES  # soft cap if you set it via env
 
         texts = []
@@ -60,7 +67,7 @@ def read_text_from_file(path: str) -> str:
             try:
                 page = reader.pages[i]
                 t = page.extract_text() or ""
-            except Exception as e:
+            except Exception:
                 t = ""  # skip unreadable page but keep going
             texts.append(t)
         return "\n".join(texts)
@@ -101,13 +108,13 @@ def file_sha1(path: str) -> str:
     return h.hexdigest()
 
 def ensure_collection(client: QdrantClient, collection: str, vector_size: int = 768, distance="Cosine"):
-    # Prefer idempotent create if not exists
+    # Try to get; if missing, create (avoid deprecated recreate_collection)
     try:
         client.get_collection(collection_name=collection)
         return
     except Exception:
         pass
-    client.recreate_collection(
+    client.create_collection(
         collection_name=collection,
         vectors_config=qmodels.VectorParams(size=vector_size, distance=distance),
     )
@@ -150,10 +157,56 @@ def format_duration(seconds: float) -> str:
         return f"{m}m {s}s"
     return f"{s}s"
 
-def embed_text(t: str, model: str, base_url: str, timeout: int = 120) -> List[float]:
+def embed_text_once(t: str, model: str, base_url: str, timeout: int = 120) -> List[float]:
     r = requests.post(f"{base_url}/api/embeddings", json={"model": model, "prompt": t}, timeout=timeout)
     r.raise_for_status()
     return r.json()["embedding"]
+
+def embed_text(t: str, model: str, base_url: str, timeout: int = 120) -> List[float]:
+    # simple retry/backoff for transient Ollama errors
+    delay = 0.0
+    last_err: Optional[Exception] = None
+    for attempt in range(1, EMBED_MAX_RETRIES + 1):
+        try:
+            if delay > 0:
+                time.sleep(delay)
+            return embed_text_once(t, model, base_url, timeout)
+        except Exception as e:
+            last_err = e
+            delay = delay * EMBED_RETRY_BACKOFF + 0.25 if delay > 0 else 0.5
+    # if we reach here, all retries failed
+    raise RuntimeError(f"Embedding failed after {EMBED_MAX_RETRIES} attempts: {last_err}")
+
+# --- NEW: resume support -------------------------------------------------------
+
+def existing_chunk_indexes(client: QdrantClient, collection: str, file_sha1: str) -> Set[int]:
+    """
+    Return the set of chunk_index values already present in Qdrant for a given file_sha1.
+    Uses scroll with a filter; IMPORTANT: use 'scroll_filter' kwarg for this client.
+    """
+    found: Set[int] = set()
+    offset = None
+    flt = qmodels.Filter(
+        must=[qmodels.FieldCondition(key="file_sha1", match=qmodels.MatchValue(value=file_sha1))]
+    )
+    while True:
+        points, offset = client.scroll(
+            collection_name=collection,
+            limit=1000,
+            with_payload=True,
+            with_vectors=False,
+            scroll_filter=flt,  # <- not "filter"
+            offset=offset,
+        )
+        for p in points:
+            ci = (p.payload or {}).get("chunk_index")
+            if isinstance(ci, int):
+                found.add(ci)
+        if not offset:
+            break
+    return found
+
+# ------------------------------------------------------------------------------
 
 def main():
     vec_size = guess_vector_size_for_model(EMBED_MODEL)
@@ -204,9 +257,29 @@ def main():
 
     for path, chunks in file_chunks:
         file_start = time.time()
-        vectors = []
+        sha1 = file_sha1(path)
 
-        for chunk in chunks:
+        # Resume: figure out which chunk indexes already exist
+        already: Set[int] = set()
+        if RESUME:
+            try:
+                already = existing_chunk_indexes(client, COLLECTION, sha1)
+            except Exception as e:
+                print(f"[WARN] resume lookup failed for {os.path.basename(path)}: {e}", flush=True)
+
+        # Select only missing chunks
+        to_embed = [(i, c) for i, c in enumerate(chunks) if i not in already] if RESUME else list(enumerate(chunks))
+
+        if RESUME:
+            print(f"[RESUME] {os.path.basename(path)}: have {len(already)}/{len(chunks)}; embedding {len(to_embed)} missing.", flush=True)
+
+        if not to_embed:
+            # nothing to do for this file
+            continue
+
+        # Embed (only missing)
+        vectors: List[List[float]] = []
+        for _, chunk in to_embed:
             vec = embed_text(chunk, EMBED_MODEL, OLLAMA_URL)
             vectors.append(vec)
             processed += 1
@@ -224,11 +297,10 @@ def main():
 
         file_elapsed = time.time() - file_start
 
-        # Build points & upsert
-        sha1 = file_sha1(path)
+        # Build points & upsert (only for missing indexes)
         now = int(time.time())
-        points = []
-        for idx, (chunk, vec) in enumerate(zip(chunks, vectors)):
+        points: List[qmodels.PointStruct] = []
+        for (idx, chunk), vec in zip(to_embed, vectors):
             pid = int(hashlib.md5(f"{sha1}:{idx}".encode()).hexdigest()[:16], 16) % (2**63 - 1)
             payload = {
                 "source_path": os.path.abspath(path),
@@ -240,10 +312,17 @@ def main():
             }
             points.append(qmodels.PointStruct(id=pid, vector=vec, payload=payload))
 
-        upsert_batches(client, COLLECTION, points, BATCH_SIZE)
-        total_points += len(points)
-        rate_file = len(chunks) / file_elapsed if file_elapsed > 0 else 0.0
-        print(f"[OK] {path}: {len(points)} chunks upserted in {format_duration(file_elapsed)} ({rate_file:.1f} ch/s)", flush=True)
+        if points:
+            upsert_batches(client, COLLECTION, points, BATCH_SIZE)
+            total_points += len(points)
+
+        have_now = len(already) + len(points) if RESUME else len(points)
+        rate_file = (len(to_embed) / file_elapsed) if file_elapsed > 0 else 0.0
+        print(
+            f"[OK] {os.path.basename(path)}: upserted {len(points)} missing chunks "
+            f"(now have ~{have_now}/{len(chunks)}). Took {format_duration(file_elapsed)} ({rate_file:.1f} ch/s)",
+            flush=True
+        )
 
     pbar.close()
     total_elapsed = time.time() - global_start
@@ -255,11 +334,8 @@ def main():
     print(f"Collection: {COLLECTION}", flush=True)
     print(f"Status: {info.status}, vectors count (approx): {approx_count}", flush=True)
     print(f"Total upserted this run: {total_points}", flush=True)
-    rate_global = total_chunks / total_elapsed if total_elapsed > 0 else 0.0
+    rate_global = (processed / total_elapsed) if total_elapsed > 0 else 0.0
     print(f"Total embedding time: {format_duration(total_elapsed)} ({rate_global:.1f} chunks/sec)", flush=True)
-    remaining = total_chunks - processed
-    if remaining > 0:
-        print(f"⚠️  Warning: {remaining} chunks unprocessed.", flush=True)
 
 if __name__ == "__main__":
     main()

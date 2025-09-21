@@ -89,6 +89,7 @@ services:
       OLLAMA_DEFAULT_MODEL: mistral:7b-instruct
       OLLAMA_CONNECT_TIMEOUT: "10"
       OLLAMA_READ_TIMEOUT: "600"
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-regdocs_v1} 
     working_dir: /workspace/apps/api
     volumes:
       - ..:/workspace
