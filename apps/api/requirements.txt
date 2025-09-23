@@ -1,5 +1,6 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
+protobuf>=6.31.1,<7
 pydantic==2.9.2
 psycopg[binary]==3.2.3
 qdrant-client==1.10.1
