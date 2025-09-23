@@ -1,2 +1,4 @@
+protobuf==6.33.0
+grpcio-tools==1.75.0
 streamlit==1.38.0
 requests==2.32.3
