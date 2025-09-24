@@ -1,1 +1,3 @@
-
+llama3:8b-instruct
+mistral:7b-instruct
+nomic-embed-text:latest
