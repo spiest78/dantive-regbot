@@ -1,54 +1,66 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 0) Bypass guard for troubleshooting (leave this in!)
+LOG_DIR=/workspace/logs
+REPO_DIR=/workspace/dantive-regbot
+SUPERVISOR_CONF="${REPO_DIR}/infra/supervisor/supervisord.conf"
+
+mkdir -p "$LOG_DIR" /workspace/{datasets,markers}
+
+# --- guard to bypass startup ---
 if [ -f /workspace/.disable_startup ] || [ -n "${SKIP_STARTUP:-}" ]; then
-  echo "[startup_pod] bypassed"; exit 0
+  echo "[startup_pod] bypassed"
+  exit 0
 fi
 
-# 1) Ensure NV structure
-mkdir -p /workspace/{logs,postgres,qdrant,ollama,datasets,markers,bin}
+echo "[startup_pod] starting…"
 
-# 2) Sync repo (assumes repo already cloned at /workspace/dantive-regbot)
-cd /workspace/dantive-regbot
-# Be conservative: reset local changes, clean untracked files (safe on diagnostic branch)
-git reset --hard
-git clean -fd
-git fetch --all --prune
+# --- make git trust this worktree ---
+git config --global --add safe.directory "$REPO_DIR" || true
 
-# Use diagnostic branch when testing; fall back to main if not present
-BRANCH="${STARTUP_BRANCH:-runpod-diagnose-20250924}"
-git checkout "${BRANCH}" || git checkout main
-git pull --rebase
-
-# 3) Patch public API URL if Runpod sets API_PROXY_HOST
-if [ -n "${API_PROXY_HOST:-}" ] && [ -f infra/.env ]; then
-  # replace API_PUBLIC_BASE line if present; otherwise append
-  if grep -q '^API_PUBLIC_BASE=' infra/.env 2>/dev/null; then
-    sed -i "s#^API_PUBLIC_BASE=.*#API_PUBLIC_BASE=https://${API_PROXY_HOST}#g" infra/.env
+# --- ensure we can fetch (SSH → HTTPS fallback) ---
+cd "$REPO_DIR"
+if ! git fetch --all --prune 2>"$LOG_DIR/git_fetch.err"; then
+  if grep -q "Host key verification failed" "$LOG_DIR/git_fetch.err"; then
+    echo "[startup_pod] SSH host key failed; switching origin to HTTPS"
+    git remote set-url origin "https://github.com/spiest78/dantive-regbot.git"
+    git fetch --all --prune
   else
-    echo "API_PUBLIC_BASE=https://${API_PROXY_HOST}" >> infra/.env
+    echo "[startup_pod] fetch failed; see $LOG_DIR/git_fetch.err"
+    cat "$LOG_DIR/git_fetch.err" >&2
+    exit 1
   fi
 fi
 
-# 4) Launch supervisor with the repo's config (supervisor file must be in repo)
-SUPERVISOR_CONF="/workspace/dantive-regbot/infra/supervisor/supervisord.conf"
-if [ ! -f "${SUPERVISOR_CONF}" ]; then
-  echo "[startup_pod] missing supervisord.conf at ${SUPERVISOR_CONF}" >&2
-  exit 1
+# Try to use diagnostics branch; fallback to main
+if git rev-parse --verify origin/runpod-diagnose-20250924 >/dev/null 2>&1; then
+  git checkout runpod-diagnose-20250924
+  git pull --rebase origin runpod-diagnose-20250924
+else
+  git checkout main
+  git pull --rebase origin main
 fi
 
-# Start supervisord (it will handle starting services). Use -c to point to the repo copy.
-# --- bootstrap dependencies and venv ---
+# --- ensure supervisord is available ---
+if ! command -v supervisord >/dev/null 2>&1; then
+  echo "[startup_pod] installing supervisor…"
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y && apt-get install -y supervisor
+  else
+    python3 -m pip install --upgrade pip
+    python3 -m pip install supervisor
+  fi
+fi
 
-bash /workspace/dantive-regbot/infra/bootstrap_deps.sh || exit 1
+# --- bootstrap dependencies & NV dirs ---
+bash "${REPO_DIR}/infra/bootstrap_deps.sh" || exit 1
 
+# --- ensure app venv and requirements ---
 [ -d /workspace/venv ] || python3 -m venv /workspace/venv
-
 /workspace/venv/bin/pip install --upgrade pip
+[ -f "${REPO_DIR}/services/api/requirements.txt" ] && /workspace/venv/bin/pip install -r "${REPO_DIR}/services/api/requirements.txt" || true
+[ -f "${REPO_DIR}/services/ui/requirements.txt"  ] && /workspace/venv/bin/pip install -r "${REPO_DIR}/services/ui/requirements.txt"  || true
 
-[ -f /workspace/dantive-regbot/services/api/requirements.txt ] && /workspace/venv/bin/pip install -r /workspace/dantive-regbot/services/api/requirements.txt || true
-
-[ -f /workspace/dantive-regbot/services/ui/requirements.txt ]  && /workspace/venv/bin/pip install -r /workspace/dantive-regbot/services/ui/requirements.txt  || true
-
-exec supervisord -c "${SUPERVISOR_CONF}"
+echo "[startup_pod] launching supervisord…"
+exec "$(command -v supervisord)" -c "${SUPERVISOR_CONF}"
