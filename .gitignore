@@ -1,1 +1,4 @@
-
+# keep data out of git
+apps/data/
+datasets/
+.env
