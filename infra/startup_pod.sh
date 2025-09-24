@@ -39,4 +39,16 @@ if [ ! -f "${SUPERVISOR_CONF}" ]; then
 fi
 
 # Start supervisord (it will handle starting services). Use -c to point to the repo copy.
+# --- bootstrap dependencies and venv ---
+
+bash /workspace/dantive-regbot/infra/bootstrap_deps.sh || exit 1
+
+[ -d /workspace/venv ] || python3 -m venv /workspace/venv
+
+/workspace/venv/bin/pip install --upgrade pip
+
+[ -f /workspace/dantive-regbot/services/api/requirements.txt ] && /workspace/venv/bin/pip install -r /workspace/dantive-regbot/services/api/requirements.txt || true
+
+[ -f /workspace/dantive-regbot/services/ui/requirements.txt ]  && /workspace/venv/bin/pip install -r /workspace/dantive-regbot/services/ui/requirements.txt  || true
+
 exec supervisord -c "${SUPERVISOR_CONF}"
