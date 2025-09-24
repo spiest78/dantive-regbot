@@ -1,4 +1,5 @@
 name: dantive-regbot
+version: "3.9"
 
 services:
   db:
@@ -9,100 +10,106 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+    working_dir: /workspace
     volumes:
-      # Persist Postgres on the Runpod Network Volume
+      - ..:/workspace
       - /workspace/postgres:/var/lib/postgresql/data
-      - ./postgres/init:/docker-entrypoint-initdb.d:ro
     ports:
-      - "5432:5432"
+      - "${PG_PORT:-5432}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
-      interval: 5s
-      timeout: 5s
-      retries: 30
-
-  qdrant:
-    image: qdrant/qdrant:v1.12.3
-    restart: unless-stopped
-    ports:
-      - "${QDRANT_PORT}:6333"
-    volumes:
-      # Persist Qdrant storage on the Network Volume
-      - /workspace/qdrant:/qdrant/storage
-    # Keeping simple start dependency (Qdrant boots fast)
-    # healthcheck:
-    #   test: ["CMD", "/qdrant/healthcheck"]
-    #   interval: 5s
-    #   timeout: 5s
-    #   retries: 30
-
-  ollama:
-    image: ollama/ollama:0.3.12
-    restart: unless-stopped
-    # === GPU on Runpod ===
-    runtime: nvidia
-    environment:
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      OLLAMA_KEEP_ALIVE: "30m"
-    ports:
-      - "${OLLAMA_PORT}:11434"
-    volumes:
-      # Persist models on the Network Volume (fast next boots)
-      - /workspace/ollama:/root/.ollama
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
       interval: 10s
       timeout: 5s
       retries: 30
 
-  # One-shot model pull into the ollama volume (safe to re-run)
-  ollama-init:
-    image: ollama/ollama:0.3.12
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    environment:
+      - QDRANT__STORAGE__STORAGE_PATH=/qdrant/storage
+    working_dir: /workspace
+    volumes:
+      - ..:/workspace
+      - /workspace/qdrant:/qdrant/storage
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:6333/collections > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    environment:
+      - OLLAMA_MODELS=/root/.ollama
+    working_dir: /workspace
+    volumes:
+      - ..:/workspace
+      - /workspace/ollama:/root/.ollama
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:11434/api/tags > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # one-shot: pre-pull models if missing (idempotent)
+  pull_models:
+    image: ollama/ollama:latest
     depends_on:
       ollama:
         condition: service_healthy
-    env_file: .env                 # <-- read OLLAMA_MODELS from .env
     environment:
-      OLLAMA_HOST: http://ollama:11434
+      - OLLAMA_HOST=ollama:11434
+    working_dir: /workspace
     volumes:
+      - ..:/workspace
       - /workspace/ollama:/root/.ollama
-    entrypoint: ["/bin/sh","-lc"]
-    command: |
-      models="${OLLAMA_MODELS:-mistral:7b-instruct,nomic-embed-text}";
-      IFS=,;
-      for m in $models; do
-        echo "Pulling $m";
-        ollama pull "$m" || true;
-      done
+      - ../ops/entrypoint.pull-models.sh:/entrypoint.sh:ro
+      - ../ops/model-list.txt:/models.txt:ro
+      - /workspace/markers:/markers
+    entrypoint: ["/bin/bash","/entrypoint.sh"]
+    restart: "no"
+
+  # one-shot: ingest/seed RAG (idempotent)
+  ingest:
+    build: ../services/ingest
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - EMBED_MODEL=${EMBED_MODEL:-nomic-embed-text:latest}
+      - COLLECTION_NAME=${COLLECTION_NAME:-regdocs_v1}
+      - DATASET_DIR=/datasets/regdocs
+    working_dir: /workspace
+    volumes:
+      - ..:/workspace
+      - /workspace/datasets:/datasets
+      - /workspace/markers:/markers
+      - ../ops/entrypoint.ingest.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/bash","/entrypoint.sh"]
+    restart: "no"
 
   api:
-    build:
-      context: ..
-      dockerfile: apps/api/Dockerfile
+    build: ../services/api
     restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
-      qdrant:
-        condition: service_started
-      # no hard dep on ollama (API can lazy-connect)
-    env_file: .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-      QDRANT_URL: http://qdrant:6333
-      OLLAMA_URL: http://ollama:11434
-      OLLAMA_DEFAULT_MODEL: mistral:7b-instruct
-      OLLAMA_CONNECT_TIMEOUT: "10"
-      OLLAMA_READ_TIMEOUT: "600"
-      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-regdocs_v1}
+      - QDRANT_URL=http://qdrant:6333
+      - OLLAMA_URL=http://ollama:11434
+      - API_PUBLIC_BASE=${API_PUBLIC_BASE:-http://127.0.0.1:8000}
     working_dir: /workspace/apps/api
     volumes:
       - ..:/workspace
     ports:
       - "${API_PORT:-8000}:8000"
     command: >
-      uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+      uvicorn main:app --host 0.0.0.0 --port 8000
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health || exit 1"]
       interval: 5s
@@ -110,16 +117,10 @@ services:
       retries: 30
 
   ui:
-    build:
-      context: ../apps/ui
-      dockerfile: Dockerfile
+    build: ../services/ui
     restart: unless-stopped
-    depends_on:
-      api:
-        condition: service_healthy
-    env_file: .env
     environment:
-      API_URL: http://api:8000
+      - API_URL=${API_PUBLIC_BASE:-http://127.0.0.1:8000}
     working_dir: /workspace/apps/ui
     volumes:
       - ..:/workspace
