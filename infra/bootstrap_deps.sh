@@ -1,6 +1,3 @@
-cd /workspace/dantive-regbot
-
-cat > infra/bootstrap_deps.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -26,29 +23,59 @@ if ! command -v postgres >/dev/null 2>&1; then
   fi
 fi
 
-# Ollama (skip systemd in containers)
-if ! command -v ollama >/dev/null 2>&1; then
+# ---- Ollama (standard path + persistent cache) ----
+CACHE_DIR="/workspace/bin"
+CACHE_OLLAMA="${CACHE_DIR}/ollama"
+SYS_OLLAMA="/usr/local/bin/ollama"
+mkdir -p "$CACHE_DIR" /workspace/ollama
+
+restore_from_cache() {
+  echo "[bootstrap] restoring ollama from cache -> ${SYS_OLLAMA}"
+  install -m 0755 "$CACHE_OLLAMA" "$SYS_OLLAMA"
+}
+
+install_fresh() {
   echo "[bootstrap] installing ollama (no systemd)…"
   OLLAMA_SKIP_SYSTEMD=1 curl -fsSL https://ollama.com/install.sh | sh
+}
+
+sync_cache() {
+  # refresh cache if it doesn't exist or differs
+  if [ ! -f "$CACHE_OLLAMA" ] || ! cmp -s "$SYS_OLLAMA" "$CACHE_OLLAMA"; then
+    echo "[bootstrap] updating cached ollama -> ${CACHE_OLLAMA}"
+    install -m 0755 "$SYS_OLLAMA" "$CACHE_OLLAMA"
+  fi
+}
+
+# 1) If system binary is missing, try cache, else fresh install
+if ! command -v ollama >/dev/null 2>&1; then
+  if [ -x "$CACHE_OLLAMA" ]; then
+    restore_from_cache
+  else
+    install_fresh
+  fi
 fi
+
+# 2) Sanity check & cache sync
+if ! "$SYS_OLLAMA" --version >/dev/null 2>&1; then
+  echo "[bootstrap] ERROR: ollama not usable after install/restore"; exit 1
+fi
+sync_cache
 
 # Qdrant (static binary). Use "latest/download" to avoid fragile version URLs.
 if ! command -v qdrant >/dev/null 2>&1; then
   echo "[bootstrap] installing qdrant binary…"
   TMP="/tmp/qdrant.tar.gz"
   URL="https://github.com/qdrant/qdrant/releases/latest/download/qdrant-x86_64-unknown-linux-gnu.tar.gz"
-  # Retry logic
   for i in 1 2 3; do
     curl -fL "$URL" -o "$TMP" && break || sleep 2
   done
-  # Quick sanity check: ensure it's a gzip tar
   if ! gzip -t "$TMP" >/dev/null 2>&1; then
     echo "[bootstrap] ERROR: downloaded Qdrant archive is not gzip; aborting."
     ls -l "$TMP" || true
     file "$TMP" || true
     exit 1
   fi
-  # Extract only the 'qdrant' binary from the archive (strip leading dirs)
   TMPDIR="$(mktemp -d)"
   tar -xzf "$TMP" -C "$TMPDIR"
   QD_BIN="$(find "$TMPDIR" -type f -name qdrant | head -n1 || true)"
@@ -87,6 +114,3 @@ YAML
 fi
 
 echo "[bootstrap] done."
-EOF
-
-chmod +x infra/bootstrap_deps.sh
