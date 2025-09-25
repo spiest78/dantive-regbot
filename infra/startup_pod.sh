@@ -61,9 +61,26 @@ bash "${REPO_DIR}/infra/bootstrap_deps.sh" || exit 1
 /workspace/venv/bin/pip install --upgrade pip
 [ -f "${REPO_DIR}/services/api/requirements.txt" ] && /workspace/venv/bin/pip install -r "${REPO_DIR}/services/api/requirements.txt" || true
 [ -f "${REPO_DIR}/services/ui/requirements.txt"  ] && /workspace/venv/bin/pip install -r "${REPO_DIR}/services/ui/requirements.txt"  || true
-
-# keep Ollama cache persistent
+# --- Ollama preflight (repo-first, before supervisord) ---
 export OLLAMA_MODELS=/workspace/ollama
+mkdir -p "$OLLAMA_MODELS"
+
+# ensure ollama binary exists (repo bootstrap installs it)
+if ! [ -x /usr/local/bin/ollama ]; then
+  echo "[startup_pod] ollama missing, installing via bootstrap_deps.sh…"
+  bash "${REPO_DIR}/infra/bootstrap_deps.sh"
+fi
+
+# verify it actually works
+if ! /usr/local/bin/ollama --version >/dev/null 2>&1; then
+  echo "[startup_pod] ERROR: ollama not available after bootstrap"; exit 1
+fi
+
+# free 11434 if a stray 'ollama serve' is still running
+if ss -ltn | awk '{print $4}' | grep -qE '(^|:)11434$'; then
+  echo "[startup_pod] freeing port 11434 (killing stray ollama)…"
+  pkill -9 -f '/usr/local/bin/ollama serve' || true
+fi
 
 echo "[startup_pod] launching supervisord…"
 exec "$(command -v supervisord)" -c "${SUPERVISOR_CONF}"
