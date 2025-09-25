@@ -63,7 +63,7 @@ bash "${REPO_DIR}/infra/bootstrap_deps.sh"
 [ -f "${REPO_DIR}/services/ui/requirements.txt"  ] && /workspace/venv/bin/pip install -r "${REPO_DIR}/services/ui/requirements.txt"  || true
 
 # --- Ollama preflight ---
-export OLLAMA_MODELS=/workspace/ollama
+export OLLAMA_MODELS=/workspace/ollama-store
 mkdir -p "$OLLAMA_MODELS"
 
 if ! [ -x /usr/local/bin/ollama ]; then
