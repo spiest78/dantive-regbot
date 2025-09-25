@@ -82,5 +82,8 @@ if ss -ltn | awk '{print $4}' | grep -qE '(^|:)11434$'; then
   pkill -9 -f '/usr/local/bin/ollama serve' || true
 fi
 
+# --- deploy helper scripts for supervisor ---
+install -Dm755 "${REPO_DIR}/ops/pull_models.sh" /workspace/bin/ollama_pull.sh
+
 echo "[startup_pod] launching supervisord…"
 exec "$(command -v supervisord)" -c "${SUPERVISOR_CONF}"
