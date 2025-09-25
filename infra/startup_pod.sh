@@ -32,13 +32,13 @@ if ! git fetch --all --prune 2>"$LOG_DIR/git_fetch.err"; then
   fi
 fi
 
-# Try to use diagnostics branch; fallback to main
+# --- checkout branch (diagnostics if present; else main) ---
 if git rev-parse --verify origin/runpod-diagnose-20250924 >/dev/null 2>&1; then
-  git checkout runpod-diagnose-20250924
-  git pull --rebase origin runpod-diagnose-20250924
+  git checkout -f runpod-diagnose-20250924
+  git reset --hard origin/runpod-diagnose-20250924
 else
-  git checkout main
-  git pull --rebase origin main
+  git checkout -f main
+  git reset --hard origin/main
 fi
 
 # --- ensure supervisord is available ---
@@ -53,27 +53,36 @@ if ! command -v supervisord >/dev/null 2>&1; then
   fi
 fi
 
-# --- bootstrap dependencies & NV dirs ---
-bash "${REPO_DIR}/infra/bootstrap_deps.sh" || exit 1
+# --- bootstrap dependencies & NV dirs (also installs Ollama if missing) ---
+bash "${REPO_DIR}/infra/bootstrap_deps.sh"
 
 # --- ensure app venv and requirements ---
 [ -d /workspace/venv ] || python3 -m venv /workspace/venv
 /workspace/venv/bin/pip install --upgrade pip
-[ -f "${REPO_DIR}/services/api/requirements.txt" ] && /workspace/venv/bin/pip install -r "${REPO_DIR}/services/api/requirements.txt" || true
-[ -f "${REPO_DIR}/services/ui/requirements.txt"  ] && /workspace/venv/bin/pip install -r "${REPO_DIR}/services/ui/requirements.txt"  || true
+
+for req in \
+  "${REPO_DIR}/services/api/requirements.txt" \
+  "${REPO_DIR}/services/ui/requirements.txt"  \
+  "${REPO_DIR}/apps/api/requirements.txt"     \
+  "${REPO_DIR}/apps/ui/requirements.txt"
+do
+  [ -f "$req" ] && /workspace/venv/bin/pip install -r "$req" || true
+done
+
 # --- Ollama preflight (repo-first, before supervisord) ---
 export OLLAMA_MODELS=/workspace/ollama
 mkdir -p "$OLLAMA_MODELS"
 
-# ensure ollama binary exists (repo bootstrap installs it)
+# ensure ollama binary exists (bootstrap_deps should have installed it)
 if ! [ -x /usr/local/bin/ollama ]; then
-  echo "[startup_pod] ollama missing, installing via bootstrap_deps.sh…"
+  echo "[startup_pod] ollama missing, re-running bootstrap…"
   bash "${REPO_DIR}/infra/bootstrap_deps.sh"
 fi
 
-# verify it actually works
+# verify ollama actually works
 if ! /usr/local/bin/ollama --version >/dev/null 2>&1; then
-  echo "[startup_pod] ERROR: ollama not available after bootstrap"; exit 1
+  echo "[startup_pod] ERROR: ollama not available after bootstrap"
+  exit 1
 fi
 
 # free 11434 if a stray 'ollama serve' is still running
@@ -83,6 +92,7 @@ if ss -ltn | awk '{print $4}' | grep -qE '(^|:)11434$'; then
 fi
 
 # --- deploy helper scripts for supervisor ---
+mkdir -p /workspace/bin
 install -Dm755 "${REPO_DIR}/ops/pull_models.sh" /workspace/bin/ollama_pull.sh
 
 echo "[startup_pod] launching supervisord…"
