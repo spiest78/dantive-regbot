@@ -62,5 +62,8 @@ bash "${REPO_DIR}/infra/bootstrap_deps.sh" || exit 1
 [ -f "${REPO_DIR}/services/api/requirements.txt" ] && /workspace/venv/bin/pip install -r "${REPO_DIR}/services/api/requirements.txt" || true
 [ -f "${REPO_DIR}/services/ui/requirements.txt"  ] && /workspace/venv/bin/pip install -r "${REPO_DIR}/services/ui/requirements.txt"  || true
 
+# keep Ollama cache persistent
+export OLLAMA_MODELS=/workspace/ollama
+
 echo "[startup_pod] launching supervisord…"
 exec "$(command -v supervisord)" -c "${SUPERVISOR_CONF}"
