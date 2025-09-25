@@ -1,5 +1,8 @@
+# Core chat model
 mistral:7b-instruct
+
+# Embeddings
 nomic-embed-text:latest
-llama3.2:3b-instruct
-# fallback (kept for future availability)
-# llama3:8b-instruct
+
+# Llama (legacy tag; script will try fallbacks automatically)
+llama3:8b-instruct
