@@ -1,96 +1,95 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_DIR="/workspace/dantive-regbot"
-LOG_DIR="/workspace/logs"
-mkdir -p "$LOG_DIR"
+# Config (env overridable)
+OLLAMA_URL="${OLLAMA_URL:-http://127.0.0.1:11434}"
+MODEL_LIST_FILE="${MODEL_LIST_FILE:-/workspace/dantive-regbot/ops/model-list.txt}"
+MARKER="${MARKER:-/workspace/markers/models_pulled.txt}"
 
-export OLLAMA_HOST="127.0.0.1:11434"
-export OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/ollama}"
-mkdir -p "$OLLAMA_MODELS"
+mkdir -p "$(dirname "$MARKER")"
 
-JQ_BIN="$(command -v jq || true)"
+# If we already completed a run, skip
+if [[ -f "$MARKER" ]]; then
+  echo "[pull-models] already done."
+  exit 0
+fi
 
-log() { echo "[pull_models] $*" | tee -a "$LOG_DIR/ollama-pull.log" >&2; }
+# Wait for Ollama to be reachable
+echo "[pull-models] waiting for Ollama at $OLLAMA_URL …"
+until curl -fsS "$OLLAMA_URL/api/tags" >/dev/null; do
+  sleep 2
+done
 
-wait_for_ollama() {
-  local i
-  for i in $(seq 1 90); do
-    if curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
+# Fallbacks for legacy/retired tags (extend as needed)
+fallbacks_for() {
+  case "$1" in
+    "llama3:8b-instruct")
+      # Try newer public tags in descending preference
+      echo "llama3.1:8b-instruct"
+      echo "llama3.2:3b-instruct"
+      ;;
+    "llama3.1:8b-instruct")
+      echo "llama3.2:3b-instruct"
+      ;;
+    *)
+      ;;
+  esac
+}
+
+trim() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+
+pull_one() {
+  local name="$1"
+  # already present?
+  if curl -fsS "$OLLAMA_URL/api/show" -H 'Content-Type: application/json' \
+       -d "{\"name\":\"$name\"}" >/dev/null 2>&1; then
+    echo "[pull-models] present: $name (skip)"
+    return 0
+  fi
+
+  echo "[pull-models] pulling: $name"
+  if out="$(curl -sS -w '\n%{http_code}\n' "$OLLAMA_URL/api/pull" \
+            -H 'Content-Type: application/json' \
+            -d "{\"name\":\"$name\"}")"; then
+    code="$(printf '%s' "$out" | tail -n1)"
+    if [[ "$code" == "200" || "$code" == "201" ]]; then
+      echo "[pull-models] success: $name"
       return 0
     fi
-    sleep 1
-  done
-  log "ERROR: Ollama API not reachable at ${OLLAMA_HOST} after 90s"
+    # non-2xx: keep going below for fallback handling
+  else
+    # network/transport error — try fallbacks
+    code="curl_error"
+  fi
+
+  # Try fallbacks on invalid/retired tags
+  if [[ "$code" == "400" || "$code" == "404" || "$code" == "curl_error" ]]; then
+    local fb
+    while read -r fb; do
+      [[ -z "$fb" ]] && continue
+      echo "[pull-models] '$name' failed (code=$code), trying fallback: $fb"
+      if pull_one "$fb"; then
+        echo "[pull-models] mapped '$name' → '$fb' (ok)"
+        return 0
+      fi
+    done < <(fallbacks_for "$name")
+  fi
+
+  echo "[pull-models] WARNING: could not pull '$name' (status=$code); continuing."
   return 1
 }
 
-have_model() {
-  local tag="$1"
-  # If jq is present, use it; otherwise a grep fallback.
-  if [ -n "$JQ_BIN" ]; then
-    curl -fsS "http://${OLLAMA_HOST}/api/tags" \
-    | jq -e --arg n "$tag" '.models[].name | select(. == $n)' >/dev/null 2>&1
-  else
-    curl -fsS "http://${OLLAMA_HOST}/api/tags" \
-    | grep -q "\"name\":\"${tag}\""
-  fi
-}
-
-pull_if_missing() {
-  local tag="$1"
-  if have_model "$tag"; then
-    log "✓ already present: ${tag}"
-    return 0
-  fi
-  log "→ pulling ${tag}"
-  if /usr/local/bin/ollama pull "$tag"; then
-    log "✓ pulled: ${tag}"
-    return 0
-  fi
-
-  # Common benign failure when a community tag is unavailable on the host registry.
-  log "⚠️  could not pull ${tag}; skipping"
-  return 0
-}
-
-# ---- build desired tag list ----
-declare -a TAGS=()
-
-# 1) repo-provided list if present
-if [ -f "${REPO_DIR}/ops/model-list.txt" ]; then
-  # remove comments and blanks
-  while IFS= read -r line; do
-    line="${line%%#*}"
-    line="$(echo "$line" | xargs || true)"
-    [ -n "${line}" ] && TAGS+=("$line")
-  done < "${REPO_DIR}/ops/model-list.txt"
+# Read desired models and process
+if [[ ! -s "$MODEL_LIST_FILE" ]]; then
+  echo "[pull-models] WARNING: model list file missing/empty: $MODEL_LIST_FILE"
+else
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line="$(printf '%s' "$raw" | trim)"
+    [[ -z "$line" || "$line" =~ ^# ]] && continue
+    pull_one "$line" || true
+  done < "$MODEL_LIST_FILE"
 fi
 
-# 2) sane defaults (include fallbacks for llama)
-TAGS+=(
-  "llama3.1:8b-instruct"
-  "llama3:8b-instruct"
-  "mistral:7b-instruct"
-  "nomic-embed-text:latest"
-)
-
-# de-dup while preserving order
-declare -A seen=()
-declare -a uniq=()
-for t in "${TAGS[@]}"; do
-  if [ -z "${seen[$t]+x}" ]; then
-    uniq+=("$t")
-    seen[$t]=1
-  fi
-done
-TAGS=("${uniq[@]}")
-
-# ---- do the work ----
-wait_for_ollama
-
-for tag in "${TAGS[@]}"; do
-  pull_if_missing "$tag"
-done
-
-log "done."
+# Done marker
+date > "$MARKER"
+echo "[pull-models] done."
