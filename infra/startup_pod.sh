@@ -5,7 +5,7 @@ LOG_DIR=/workspace/logs
 REPO_DIR=/workspace/dantive-regbot
 SUPERVISOR_CONF="${REPO_DIR}/infra/supervisor/supervisord.conf"
 
-mkdir -p "$LOG_DIR" /workspace/{datasets,markers}
+mkdir -p "$LOG_DIR" /workspace/{datasets,markers,bin}
 
 # --- guard to bypass startup ---
 if [ -f /workspace/.disable_startup ] || [ -n "${SKIP_STARTUP:-}" ]; then
@@ -15,7 +15,7 @@ fi
 
 echo "[startup_pod] starting…"
 
-# --- make git trust this worktree ---
+# --- trust this worktree for git ---
 git config --global --add safe.directory "$REPO_DIR" || true
 
 # --- ensure we can fetch (SSH → HTTPS fallback) ---
@@ -32,13 +32,13 @@ if ! git fetch --all --prune 2>"$LOG_DIR/git_fetch.err"; then
   fi
 fi
 
-# --- checkout branch (diagnostics if present; else main) ---
+# Prefer diagnostics branch if it exists; else main
 if git rev-parse --verify origin/runpod-diagnose-20250924 >/dev/null 2>&1; then
-  git checkout -f runpod-diagnose-20250924
-  git reset --hard origin/runpod-diagnose-20250924
+  git checkout -q runpod-diagnose-20250924
+  git pull --rebase origin runpod-diagnose-20250924
 else
-  git checkout -f main
-  git reset --hard origin/main
+  git checkout -q main
+  git pull --rebase origin main
 fi
 
 # --- ensure supervisord is available ---
@@ -53,46 +53,31 @@ if ! command -v supervisord >/dev/null 2>&1; then
   fi
 fi
 
-# --- bootstrap dependencies & NV dirs (also installs Ollama if missing) ---
+# --- bootstrap system deps (installs ollama + qdrant, etc.) ---
 bash "${REPO_DIR}/infra/bootstrap_deps.sh"
 
-# --- ensure app venv and requirements ---
+# --- Python virtualenv + requirements ---
 [ -d /workspace/venv ] || python3 -m venv /workspace/venv
 /workspace/venv/bin/pip install --upgrade pip
+[ -f "${REPO_DIR}/services/api/requirements.txt" ] && /workspace/venv/bin/pip install -r "${REPO_DIR}/services/api/requirements.txt" || true
+[ -f "${REPO_DIR}/services/ui/requirements.txt"  ] && /workspace/venv/bin/pip install -r "${REPO_DIR}/services/ui/requirements.txt"  || true
 
-for req in \
-  "${REPO_DIR}/services/api/requirements.txt" \
-  "${REPO_DIR}/services/ui/requirements.txt"  \
-  "${REPO_DIR}/apps/api/requirements.txt"     \
-  "${REPO_DIR}/apps/ui/requirements.txt"
-do
-  [ -f "$req" ] && /workspace/venv/bin/pip install -r "$req" || true
-done
-
-# --- Ollama preflight (repo-first, before supervisord) ---
+# --- Ollama preflight ---
 export OLLAMA_MODELS=/workspace/ollama
 mkdir -p "$OLLAMA_MODELS"
 
-# ensure ollama binary exists (bootstrap_deps should have installed it)
 if ! [ -x /usr/local/bin/ollama ]; then
-  echo "[startup_pod] ollama missing, re-running bootstrap…"
-  bash "${REPO_DIR}/infra/bootstrap_deps.sh"
-fi
-
-# verify ollama actually works
-if ! /usr/local/bin/ollama --version >/dev/null 2>&1; then
-  echo "[startup_pod] ERROR: ollama not available after bootstrap"
+  echo "[startup_pod] ERROR: ollama missing after bootstrap"
   exit 1
 fi
 
 # free 11434 if a stray 'ollama serve' is still running
-if ss -ltn | awk '{print $4}' | grep -qE '(^|:)11434$'; then
+if command -v ss >/dev/null 2>&1 && ss -ltn | awk '{print $4}' | grep -qE '(^|:)11434$'; then
   echo "[startup_pod] freeing port 11434 (killing stray ollama)…"
   pkill -9 -f '/usr/local/bin/ollama serve' || true
 fi
 
-# --- deploy helper scripts for supervisor ---
-mkdir -p /workspace/bin
+# --- deploy helper for supervisor ---
 install -Dm755 "${REPO_DIR}/ops/pull_models.sh" /workspace/bin/ollama_pull.sh
 
 echo "[startup_pod] launching supervisord…"
